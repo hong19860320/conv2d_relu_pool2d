@@ -7,7 +7,7 @@ set(CMAKE_CXX_COMPILER "g++")
 
 project(conv2d_relu_pool2d)
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Os -std=c++11 -fvisibility=hidden -fvisibility-inlines-hidden -fexceptions -fasynchronous-unwind-tables -funwind-tables")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -std=c++11 -fvisibility=hidden -fvisibility-inlines-hidden -fexceptions -fasynchronous-unwind-tables -funwind-tables")
 
 find_package(OpenMP REQUIRED)
 if(OpenMP_FOUND OR OpenMP_CXX_FOUND)

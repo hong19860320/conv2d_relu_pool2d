@@ -12,107 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <limits>
-#include <random>
-#include <stdio.h>
-#include <string.h>
-#include <sys/time.h>
-#include <unistd.h>
-
-const int MAX_OMP_THEADS_NUM = 4;
-
-int64_t shape_production(const std::vector<int64_t> &shape) {
-  int64_t product = 1;
-  for (size_t i = 0; i < shape.size(); i++) {
-    product *= shape[i];
-  }
-  return product;
-}
-
-template <typename T>
-inline void fill_data_with_random(T *dio, T vstart, T vend, size_t size) {
-  std::random_device rd;
-  std::mt19937 gen(rd());
-  std::uniform_real_distribution<float> dis(0, 1.f);
-  for (size_t i = 0; i < size; ++i) {
-    dio[i] = static_cast<T>(vstart + (vend - vstart) * dis(gen));
-  }
-}
-
-inline int64_t get_current_us() {
-  struct timeval time;
-  gettimeofday(&time, NULL);
-  return 1000000LL * (int64_t)time.tv_sec + (int64_t)time.tv_usec;
-}
-
-class Tensor {
-public: // NOLINT
-  Tensor() {}
-  explicit Tensor(const std::vector<int64_t> &shape) : shape_(shape) {}
-  ~Tensor() {}
-
-  void Resize(const std::vector<int64_t> &shape) { shape_ = shape; }
-
-  float *data() {
-    auto size = shape_production(shape_);
-    if (size > buffer_.size()) {
-      buffer_.resize(size);
-    }
-    return buffer_.data();
-  }
-
-  int64_t rank() const { return shape_.size(); }
-
-  int64_t size() const { return shape_production(shape_); }
-
-  std::vector<int64_t> shape() const { return shape_; }
-
-  std::vector<int64_t> strides() const {
-    int64_t r = rank();
-    std::vector<int64_t> ss(r);
-    ss[r - 1] = 1;
-    for (int64_t i = r - 2; i >= 0; i--) {
-      ss[i] = ss[i + 1] * shape_[i + 1];
-    }
-    return ss;
-  }
-
-  bool operator==(Tensor &tensor) { // NOLINT
-    int64_t r = rank();
-    if (tensor.rank() != r)
-      return false;
-    for (int64_t i = 0; i < r; i++) {
-      if (shape_[i] != tensor.shape()[i])
-        return false;
-    }
-    int64_t s = size();
-    if (tensor.size() != s)
-      return false;
-    for (int64_t i = 0; i < s; i++) {
-      double a = buffer_[i];
-      double b = tensor.data()[i];
-      const double threshold = 1e-5f;
-      if (fabs(a - b) >
-          std::max(threshold * std::max(fabs(a), fabs(b)), threshold)) {
-        auto ss = strides();
-        printf("[");
-        int64_t remain = i;
-        for (int64_t j = 0; j < r; j++) {
-          auto coord = remain / ss[j];
-          remain %= ss[j];
-          printf("%ld,", coord);
-        }
-        printf("] %f, %f\n", a, b);
-        return false;
-      }
-    }
-    return true;
-  }
-
-private: // NOLINT
-  std::vector<float> buffer_;
-  std::vector<int64_t> shape_;
-};
+#include "conv2d_relu_pool2d.h"
 
 typedef void (*Conv2DRELUPool2DFunction)(
     Tensor *input_tensor, Tensor *weight_tensor, Tensor *bias_tensor,
@@ -394,6 +294,85 @@ void conv2d_3x3s1p1d1_relu_pool2d_avg_3x3s1p1d1_conv2d_relu_pool2d_fused_omp(
   *calc_end_time = get_current_us();
 }
 
+void conv2d_3x3s1p1d1_relu_pool2d_avg_3x3s1p1d1_conv2d_relu_pool2d_fused_reduce_computation_and_memory_copy(
+    Tensor *input_tensor, Tensor *weight_tensor, Tensor *bias_tensor,
+    Tensor *output_tensor, int64_t *calc_start_time, int64_t *calc_end_time) {
+  EXTRACT_INPUTS_OUTPUTS_PARAMS
+
+  auto workspace_data = reinterpret_cast<float*>(Workspace::Instance()->data());
+  *calc_start_time = get_current_us();
+  // Conv2D+RELU fused
+  //   FLOPs = 2 * batch_size * output_channel_size * output_height *
+  //   output_width * input_channel_size * 3 * 3
+  //           + batch_size * output_channel_size * output_height * output_width
+  //   Load Insts = 2 * batch_size * output_channel_size * output_height *
+  //   output_width * input_channel_size * 3 * 3
+  //   Write Insts = batch_size * output_channel_size * output_height *
+  //   output_width
+  // Pool2D (cache friendly)
+  //   FLOPs = batch_size * output_channel_size * output_height * output_width *
+  //   3 * 3
+  //   Load Insts = batch_size * output_channel_size * output_height *
+  //   output_width * 3 * 3
+  //   Write Insts = batch_size * output_channel_size * output_height *
+  //   output_width
+  int ioffset = 0;
+  for (int bs = 0; bs < batch_size; bs++) {
+    int woffset = 0;
+    for (int oc = 0; oc < output_channel_size; oc++) {
+      float* block_data[3];
+      block_data[0] = workspace_data;
+      block_data[1] = block_data[0] + output_width + 2;
+      block_data[2] = block_data[1] + output_width + 2;
+      memset(workspace_data, 0, sizeof(float) * (output_width + 2) * 3);
+      for (int oh = 0; oh < output_height + 1; oh++) {
+        if (oh < output_height) {
+          for (int ow = 0; ow < output_width; ow++) {
+            float result = bias_data[oc];
+            int iwin = ioffset + oh * input_strides[2] + ow * input_strides[3];
+            int wwin = woffset;
+            for (int ic = 0; ic < input_channel_size; ic++) {
+              if (oh > 0) {
+                if (ow > 0) result += input_data[iwin - input_strides[2] - 1] * weight_data[wwin];
+                result += input_data[iwin - input_strides[2]] * weight_data[wwin + 1];
+                if (ow < input_width - 1) result += input_data[iwin - input_strides[2] + 1] * weight_data[wwin + 2];
+              }
+              if (ow > 0) result += input_data[iwin - 1] * weight_data[wwin + 3];
+              result += input_data[iwin] * weight_data[wwin + 4];
+              if (ow < input_width - 1) result += input_data[iwin + 1] * weight_data[wwin + 5];
+              if (oh < input_height - 1) {
+                if (ow > 0) result += input_data[iwin + input_strides[2] - 1] * weight_data[wwin + 6];
+                result += input_data[iwin + input_strides[2]] * weight_data[wwin + 7];
+                if (ow < input_width - 1) result += input_data[iwin + input_strides[2] + 1] * weight_data[wwin + 8];
+              }
+              iwin += input_strides[1];
+              wwin += weight_strides[1];
+            }
+            block_data[2][ow + 1] = result > 0.0f ? result : 0.0f;
+          }
+        } else {
+          memset(block_data[2] + 1, 0, sizeof(float) * output_width);
+        }
+        if (oh > 0) {
+          for (int ow = 0; ow < output_width; ow++) {
+            float result = block_data[0][ow] + block_data[0][ow + 1] + block_data[0][ow + 2];
+            result += block_data[1][ow] + block_data[1][ow + 1] + block_data[1][ow + 2];
+            result += block_data[2][ow] + block_data[2][ow + 1] + block_data[2][ow + 2];
+            *(output_data++) = result / 9.0f;
+          }
+        }
+        auto ptr = block_data[0];
+        block_data[0] = block_data[1];
+        block_data[1] = block_data[2];
+        block_data[2] = ptr;
+      }
+      woffset += weight_strides[0];
+    }
+    ioffset += input_strides[0];
+  }
+  *calc_end_time = get_current_us();
+}
+
 int main(int argc, char **argv) {
   // Conv2D + RELU + Pool2D
   // Conv2D: stride=[1,1], pad=[1,1], dilation=[1,1], group=1
@@ -420,6 +399,10 @@ int main(int argc, char **argv) {
       conv2d_3x3s1p1d1_relu_pool2d_avg_3x3s1p1d1_conv2d_relu_pool2d_fused,
       &input_tensor, &weight_tensor, &bias_tensor,
       &conv2d_relu_pool2d_fused_output_tensor);
+  if (!(ref_output_tensor == conv2d_relu_pool2d_fused_output_tensor)) {
+    printf("Early stop! Results check failed!\n");
+    return -1;
+  }
 
   // Optimized with Conv2D+RELU+Pool2D fused + OpenMP
   Tensor conv2d_relu_pool2d_fused_omp_output_tensor;
@@ -428,5 +411,21 @@ int main(int argc, char **argv) {
       conv2d_3x3s1p1d1_relu_pool2d_avg_3x3s1p1d1_conv2d_relu_pool2d_fused_omp,
       &input_tensor, &weight_tensor, &bias_tensor,
       &conv2d_relu_pool2d_fused_omp_output_tensor);
+  if (!(ref_output_tensor == conv2d_relu_pool2d_fused_omp_output_tensor)) {
+    printf("Early stop! Results check failed!\n");
+    return -1;
+  }
+
+  // Optimized with Conv2D+RELU+Pool2D fused, reduce the computation of data index and memory transfer
+  Tensor conv2d_relu_pool2d_fused_reduce_computation_and_memory_copy_output_tensor;
+  eval_conv2d_relu_pool2d(
+      "conv2d_3x3s1p1d1_relu_pool2d_avg_3x3s1p1d1_conv2d_relu_pool2d_fused_reduce_computation_and_memory_copy",
+      conv2d_3x3s1p1d1_relu_pool2d_avg_3x3s1p1d1_conv2d_relu_pool2d_fused_reduce_computation_and_memory_copy,
+      &input_tensor, &weight_tensor, &bias_tensor,
+      &conv2d_relu_pool2d_fused_reduce_computation_and_memory_copy_output_tensor);
+  if (!(ref_output_tensor == conv2d_relu_pool2d_fused_reduce_computation_and_memory_copy_output_tensor)) {
+    printf("Early stop! Results check failed!\n");
+    return -1;
+  }
   return 0;
 }

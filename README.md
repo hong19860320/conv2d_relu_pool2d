@@ -88,6 +88,10 @@ Based on the "Optimize 1. Conv2D+RELU+Pool2D fused", use OpenMP and multithreadi
     - Load Insts = N * OC * OH * OW * 3 * 3
     - Write Insts = N * OC * OH * OW
 
+# Optimize 3. Conv2D+RELU+Pool2D fused + Reduce the computation of data index and memory copy
+- Description
+Based on the "Optimize 1. Conv2D+RELU+Pool2D fused", we reduce the redundant calculation of data offset, avoid the calculation of boundary points, and use pointer variables to reduce redundant memory copies.
+
 # Environment and results
 - CPU: Intel(R) Xeon(R) Silver 4210 CPU @ 2.20GHz * 10 cores
 - Memory: 96 GB
@@ -99,6 +103,10 @@ The peak GLOPS of each core: 512/32x2x2x2.2=140.8 GFLOPS
 |Naive implementation|224,224|16|32|0.478478337|140.8|646.6|0.52%|
 |Optimize 1. Conv2D+RELU+Pool2D fused|224,224|16|32|0.478478337|140.8|602.2|0.56%|
 |Optimize 2. Conv2D+RELU+Pool2D fused + OpenMP(4 threads)|224,224|16|32|0.478478337|140.8*4=563.2|178.3|0.47%|
+|Naive implementation + O3|224,224|16|32|0.478478337|140.8|368.898987|0.92%|
+|Optimize 1. Conv2D+RELU+Pool2D fused + O3|224,224|16|32|0.478478337|140.8|363.092596|0.93%|
+|Optimize 2. Conv2D+RELU+Pool2D fused + OpenMP(4 threads) + O3|224,224|16|32|0.478478337|140.8*4=563.2|113.535602|0.75%|
+|Optimize 3. Conv2D+RELU+Pool2D fused + Reduce the computation of data index and memory copy + O3|224,224|16|32|0.478478337|140.8|326.706000|1.04%|
 ## How to reproduce the results
 ```
 Ubuntu 16.04/18.04
